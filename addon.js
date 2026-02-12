@@ -1,5 +1,3 @@
-böyle mi?
-
 // IPTV Stremio Addon Core (with debug logging + series (shows) support for BOTH Xtream & Direct M3U)
 // Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
 require('dotenv').config();
