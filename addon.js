@@ -323,6 +323,7 @@ class M3UEPGAddon {
     }
 
     isMovieFormat(name) {
+         // Sadece yıla göre filmleri algıla, kalite etiketlerine göre değil
         return /\(\d{4}\)/.test(name);
     }
 
