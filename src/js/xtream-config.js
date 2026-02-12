@@ -174,19 +174,20 @@
                 appendDetail('⏭ Live streams skipped');
             }
 
-            /* MOVIES (VOD) */
-            if (includeMovies) {
-                setProgress(30, 'Fetching Movies (VOD)');
-                const txt = await robustFetch(
-                    `${base}&action=get_vod_streams`,
-                    'vod_streams'
-                );
-                const arr = JSON.parse(txt);
-                vodCount = Array.isArray(arr) ? arr.length : 0;
-                appendDetail(`✔ Movies (VOD): ${vodCount.toLocaleString()}`);
-            } else {
-                appendDetail('⏭ Movies skipped');
-            }
+/* MOVIES (VOD) – categories only */
+if (includeMovies) {
+    setProgress(30, 'Fetching VOD categories');
+    const txt = await robustFetch(
+        `${base}&action=get_vod_categories`,
+        'vod_categories'
+    );
+    const categories = JSON.parse(txt);
+    vodCount = Array.isArray(categories) ? categories.length : 0;
+    appendDetail(`✔ VOD categories: ${vodCount.toLocaleString()}`);
+} else {
+    appendDetail('⏭ Movies skipped');
+}
+
 
             /* SERIES (categories only – lightweight) */
             if (includeSeries) {
