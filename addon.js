@@ -1,3 +1,5 @@
+böyle mi?
+
 // IPTV Stremio Addon Core (with debug logging + series (shows) support for BOTH Xtream & Direct M3U)
 // Version 1.4.0: Adds Direct M3U series grouping + per‑episode streams
 require('dotenv').config();
@@ -225,12 +227,10 @@ class M3UEPGAddon {
             let quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'SD';
             if (quality === 'UHD') quality = '4K';
 
-const baseName = currentItem.name
-    .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, '')
-    .replace(/\s{2,}/g, ' ')
-    .trim()
-    .toUpperCase(); // veya Title Case
-
+            const baseName = currentItem.name
+                .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, '')
+                .replace(/\s{2,}/g, ' ')
+                .trim();
 
             const key = normalizedTvgId;
 
