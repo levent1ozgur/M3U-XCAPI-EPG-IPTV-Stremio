@@ -159,64 +159,6 @@ class M3UEPGAddon {
         this.log.debug('Saved data to cache');
     }
 
-buildGenresInManifest() {
-    if (!this.manifestRef) return;
-    const tvCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_channels');
-    const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
-    const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
-
-    if (tvCatalog) {
-        const groups = [
-            ...new Set(
-                this.channels
-                    .map(c => {
-                        // category veya group-title'ı al
-                        const cat = c.category || c.attributes?.['group-title'];
-                        return cat;
-                    })
-                    .filter(Boolean)
-                    .map(s => s.trim())
-            )
-        ].sort((a, b) => a.localeCompare(b));
-        
-        if (!groups.includes('All Channels')) groups.unshift('All Channels');
-        tvCatalog.genres = groups;
-        
-        // Debug: Kategorileri logla
-        this.log.debug('TV Categories found:', groups);
-    }
-
-    if (movieCatalog) {
-        const movieGroups = [
-            ...new Set(
-                this.movies
-                    .map(c => c.category || c.attributes?.['group-title'])
-                    .filter(Boolean)
-                    .map(s => s.trim())
-            )
-        ].sort((a, b) => a.localeCompare(b));
-        movieCatalog.genres = movieGroups;
-    }
-
-    if (seriesCatalog) {
-        const seriesGroups = [
-            ...new Set(
-                this.series
-                    .map(c => c.category || c.attributes?.['group-title'])
-                    .filter(Boolean)
-                    .map(s => s.trim())
-            )
-        ].sort((a, b) => a.localeCompare(b));
-        seriesCatalog.genres = seriesGroups;
-    }
-
-    this.log.debug('Catalog genres built', {
-        tvGenres: tvCatalog?.genres?.length || 0,
-        movieGenres: movieCatalog?.genres?.length || 0,
-        seriesGenres: seriesCatalog?.genres?.length || 0
-    });
-}
-
     parseM3U(content) {
     const startTs = Date.now();
     const lines = content.split('\n');
@@ -693,34 +635,12 @@ getDetailedMeta(id) {
 async function createAddon(config) {
     const manifest = {
         id: ADDON_ID,
-        version: "2.0.0",
+        version: "2.1.0", // Versiyon yükselttik
         name: ADDON_NAME,
         description: "IPTV addon (M3U / EPG / Xtream) with encrypted configs, caching & series support (Xtream + Direct)",
         resources: ["catalog", "stream", "meta"],
         types: ["tv", "movie", "series"],
-        catalogs: [
-            {
-                type: 'tv',
-                id: 'iptv_channels',
-                name: 'IPTV Channels',
-                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'movie',
-                id: 'iptv_movies',
-                name: 'IPTV Movies',
-                extra: [{ name: 'search' }, { name: 'skip' }],
-                genres: []
-            },
-            {
-                type: 'series',
-                id: 'iptv_series',
-                name: 'IPTV Series',
-                extra: [{ name: 'genre' }, { name: 'search' }, { name: 'skip' }],
-                genres: []
-            }
-        ],
+        catalogs: [], // Boş başlat, dinamik olarak dolduracağız
         idPrefixes: ["iptv_"],
         behaviorHints: {
             configurable: true,
@@ -749,42 +669,184 @@ async function createAddon(config) {
         const addonInstance = new M3UEPGAddon(config, manifest);
         await addonInstance.loadFromCache();
         await addonInstance.updateData(true);
-        addonInstance.buildGenresInManifest();
+        
+        // Kategorileri topla
+        const tvCategories = [
+            ...new Set(
+                addonInstance.channels
+                    .map(c => c.category || c.attributes?.['group-title'])
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+
+        const movieCategories = [
+            ...new Set(
+                addonInstance.movies
+                    .map(c => c.category || c.attributes?.['group-title'])
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+
+        const seriesCategories = [
+            ...new Set(
+                addonInstance.series
+                    .map(c => c.category || c.attributes?.['group-title'])
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+
+        // TV katalogları oluştur
+        // "All Channels" katalogu
+        manifest.catalogs.push({
+            type: 'tv',
+            id: 'iptv_channels_all',
+            name: 'All TV Channels',
+            extra: [{ name: 'search' }, { name: 'skip' }]
+        });
+
+        // Her kategori için ayrı katalog
+        tvCategories.forEach((category, index) => {
+            // Güvenli ID oluştur (özel karakterleri temizle)
+            const safeId = category
+                .toLowerCase()
+                .replace(/[^a-z0-9]/g, '_')
+                .replace(/_+/g, '_')
+                .replace(/^_|_$/g, '');
+            
+            manifest.catalogs.push({
+                type: 'tv',
+                id: `iptv_tv_${safeId}`,
+                name: category,
+                extra: [{ name: 'search' }, { name: 'skip' }]
+            });
+        });
+
+        // Film katalogları
+        if (addonInstance.movies.length > 0) {
+            manifest.catalogs.push({
+                type: 'movie',
+                id: 'iptv_movies_all',
+                name: 'All Movies',
+                extra: [{ name: 'search' }, { name: 'skip' }]
+            });
+
+            movieCategories.forEach(category => {
+                const safeId = category
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]/g, '_')
+                    .replace(/_+/g, '_')
+                    .replace(/^_|_$/g, '');
+                
+                manifest.catalogs.push({
+                    type: 'movie',
+                    id: `iptv_movie_${safeId}`,
+                    name: category,
+                    extra: [{ name: 'search' }, { name: 'skip' }]
+                });
+            });
+        }
+
+        // Dizi katalogları
+        if (addonInstance.config.includeSeries !== false && addonInstance.series.length > 0) {
+            manifest.catalogs.push({
+                type: 'series',
+                id: 'iptv_series_all',
+                name: 'All Series',
+                extra: [{ name: 'search' }, { name: 'skip' }]
+            });
+
+            seriesCategories.forEach(category => {
+                const safeId = category
+                    .toLowerCase()
+                    .replace(/[^a-z0-9]/g, '_')
+                    .replace(/_+/g, '_')
+                    .replace(/^_|_$/g, '');
+                
+                manifest.catalogs.push({
+                    type: 'series',
+                    id: `iptv_series_${safeId}`,
+                    name: category,
+                    extra: [{ name: 'search' }, { name: 'skip' }]
+                });
+            });
+        }
+
+        addonInstance.log.debug('Dynamic catalogs created', {
+            tvCatalogs: tvCategories.length + 1,
+            movieCatalogs: movieCategories.length + 1,
+            seriesCatalogs: seriesCategories.length + 1,
+            totalCatalogs: manifest.catalogs.length
+        });
 
         builder.defineCatalogHandler(async (args) => {
             const start = Date.now();
             try {
                 addonInstance.updateData().catch(() => { });
                 let items = [];
-                if (args.type === 'tv' && args.id === 'iptv_channels') {
+                let categoryFilter = null;
+
+                // Catalog ID'den kategoriyi çıkar
+                if (args.id.startsWith('iptv_tv_') && args.id !== 'iptv_channels_all') {
                     items = addonInstance.channels;
-                } else if (args.type === 'movie' && args.id === 'iptv_movies') {
+                    // ID'den kategori adını bul
+                    const catalogDef = manifest.catalogs.find(c => c.id === args.id);
+                    if (catalogDef) {
+                        categoryFilter = catalogDef.name;
+                    }
+                } else if (args.id === 'iptv_channels_all') {
+                    items = addonInstance.channels;
+                } else if (args.id.startsWith('iptv_movie_') && args.id !== 'iptv_movies_all') {
                     items = addonInstance.movies;
-                } else if (args.type === 'series' && args.id === 'iptv_series') {
+                    const catalogDef = manifest.catalogs.find(c => c.id === args.id);
+                    if (catalogDef) {
+                        categoryFilter = catalogDef.name;
+                    }
+                } else if (args.id === 'iptv_movies_all') {
+                    items = addonInstance.movies;
+                } else if (args.id.startsWith('iptv_series_') && args.id !== 'iptv_series_all') {
+                    if (addonInstance.config.includeSeries !== false) {
+                        items = addonInstance.series;
+                        const catalogDef = manifest.catalogs.find(c => c.id === args.id);
+                        if (catalogDef) {
+                            categoryFilter = catalogDef.name;
+                        }
+                    }
+                } else if (args.id === 'iptv_series_all') {
                     if (addonInstance.config.includeSeries !== false)
                         items = addonInstance.series;
                 }
-                const extra = args.extra || {};
-                if (extra.genre && extra.genre !== 'All Channels') {
+
+                // Kategori filtresi uygula
+                if (categoryFilter) {
                     items = items.filter(i =>
-                        (i.category && i.category === extra.genre) ||
-                        (i.attributes && i.attributes['group-title'] === extra.genre)
+                        (i.category && i.category === categoryFilter) ||
+                        (i.attributes && i.attributes['group-title'] === categoryFilter)
                     );
                 }
+
+                // Arama filtresi
+                const extra = args.extra || {};
                 if (extra.search) {
                     const q = extra.search.toLowerCase();
                     items = items.filter(i => i.name.toLowerCase().includes(q));
                 }
+
                 const metas = items.slice(0, 200).map(i => addonInstance.generateMetaPreview(i));
+                
                 if (addonInstance.config.debug) {
                     console.log('[DEBUG] Catalog handler', {
                         type: args.type,
                         id: args.id,
+                        category: categoryFilter,
                         totalItems: items.length,
                         returned: metas.length,
                         ms: Date.now() - start
                     });
                 }
+                
                 return { metas };
             } catch (e) {
                 console.error('[CATALOG] Error', e);
@@ -792,24 +854,23 @@ async function createAddon(config) {
             }
         });
 
-  builder.defineStreamHandler(async ({ type, id }) => {
-    try {
-        const streamData = addonInstance.getStream(id);
-        if (!streamData) return { streams: [] };
-        
-        // Eğer array dönerse (birden fazla kalite), direkt kullan
-        const streams = Array.isArray(streamData) ? streamData : [streamData];
-        
-        if (addonInstance.config.debug) {
-            console.log('[DEBUG] Stream request', { id, streamCount: streams.length });
-        }
-        
-        return { streams };
-    } catch (e) {
-        console.error('[STREAM] Error', e);
-        return { streams: [] };
-    }
-});
+        builder.defineStreamHandler(async ({ type, id }) => {
+            try {
+                const streamData = addonInstance.getStream(id);
+                if (!streamData) return { streams: [] };
+                
+                const streams = Array.isArray(streamData) ? streamData : [streamData];
+                
+                if (addonInstance.config.debug) {
+                    console.log('[DEBUG] Stream request', { id, streamCount: streams.length });
+                }
+                
+                return { streams };
+            } catch (e) {
+                console.error('[STREAM] Error', e);
+                return { streams: [] };
+            }
+        });
 
         builder.defineMetaHandler(async ({ type, id }) => {
             try {
