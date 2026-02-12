@@ -159,120 +159,136 @@ class M3UEPGAddon {
         this.log.debug('Saved data to cache');
     }
 
-    parseM3U(content) {
+   parseM3U(content) {
     const startTs = Date.now();
     const lines = content.split('\n');
     const items = [];
-    const channelGroups = new Map(); // tvg-id -> kanal grubu
+    const channelGroups = new Map(); // normalized tvg-id -> channel
     let currentItem = null;
+
+    const normalize = (v) =>
+        typeof v === 'string' ? v.trim().toLowerCase() : '';
 
     for (const raw of lines) {
         const line = raw.trim();
+
         if (line.startsWith('#EXTINF:')) {
             const matches = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
             if (matches) {
                 currentItem = {
-                    duration: parseInt(matches[1]),
+                    duration: parseInt(matches[1], 10),
                     attributes: this.parseAttributes(matches[2] || ''),
                     name: (matches[3] || '').trim()
                 };
             }
-        } else if (line && !line.startsWith('#') && currentItem) {
-            currentItem.url = line;
-            currentItem.logo = currentItem.attributes['tvg-logo'];
-            currentItem.epg_channel_id = currentItem.attributes['tvg-id'] || currentItem.attributes['tvg-name'];
-            currentItem.category = currentItem.attributes['group-title'];
+            continue;
+        }
 
-            const group = (currentItem.attributes['group-title'] || '').toLowerCase();
-            const lower = currentItem.name.toLowerCase();
-            const isMovie = group.includes('movie') || lower.includes('movie') || this.isMovieFormat(currentItem.name);
-            const isSeries = !isMovie && (
-                group.includes('series') || 
-                group.includes('show') || 
-                /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) || 
+        if (!line || line.startsWith('#') || !currentItem) continue;
+
+        currentItem.url = line;
+        currentItem.logo = currentItem.attributes['tvg-logo'];
+
+        const rawTvgId =
+            currentItem.attributes['tvg-id'] ||
+            currentItem.attributes['tvg-name'] ||
+            '';
+
+        const normalizedTvgId = normalize(rawTvgId);
+        const groupTitleRaw = currentItem.attributes['group-title'] || '';
+        const groupTitleNorm = normalize(groupTitleRaw);
+
+        currentItem.epg_channel_id = normalizedTvgId;
+        currentItem.category = groupTitleRaw;
+
+        const nameLower = currentItem.name.toLowerCase();
+
+        const isMovie =
+            groupTitleNorm.includes('movie') ||
+            this.isMovieFormat(currentItem.name);
+
+        const isSeries =
+            !isMovie &&
+            (
+                groupTitleNorm.includes('series') ||
+                /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) ||
                 /\bSeason\s?\d+/i.test(currentItem.name)
             );
-            
-            currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
 
-            // TV kanalları için birleştirme yap
-            if (currentItem.type === 'tv' && currentItem.epg_channel_id) {
-                const groupKey = currentItem.epg_channel_id;
-                
-                // Kalite bilgisini ayıkla (4K, FHD, HD)
-                const qualityMatch = currentItem.name.match(/\b(4K|FHD|HD|SD)\b/i);
-                const quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'SD';
-                
-                // Temel kanal adını temizle (kalite bilgisi olmadan)
-                const baseName = currentItem.name.replace(/\s*(4K|FHD|HD|SD)\s*/gi, '').trim();
-                
-                if (!channelGroups.has(groupKey)) {
-                    // İlk kez görülen kanal
-                    const channelId = `iptv_${crypto.createHash('md5').update(groupKey).digest('hex').substring(0, 16)}`;
-                    channelGroups.set(groupKey, {
-                        id: channelId,
-                        name: baseName,
-                        type: 'tv',
-                        attributes: currentItem.attributes,
-                        category: currentItem.category, // İlk kategoriyi kullan
-                        logo: currentItem.logo,
-                        epg_channel_id: currentItem.epg_channel_id,
-                        url: currentItem.url,
-                        streams: []
-                    });
-                } else {
-                    // Mevcut kanal - kategoriyi güncelle (eğer yoksa)
-                    const channel = channelGroups.get(groupKey);
-                    if (!channel.category && currentItem.category) {
-                        channel.category = currentItem.category;
-                    }
-                    // Attributes'ı güncelle (kategori bilgisi için)
-                    if (currentItem.attributes['group-title'] && !channel.attributes['group-title']) {
-                        channel.attributes = currentItem.attributes;
-                    }
-                }
-                
-                // Bu kaliteyi stream listesine ekle
-                const channel = channelGroups.get(groupKey);
-                channel.streams.push({
-                    quality: quality,
-                    url: currentItem.url,
-                    name: currentItem.name
+        currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
+
+        /* ===========================
+           TV CHANNEL MERGE (FIXED)
+           =========================== */
+        if (currentItem.type === 'tv' && normalizedTvgId) {
+            const qualityMatch = currentItem.name.match(/\b(4K|UHD|FHD|HD|SD)\b/i);
+            let quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'SD';
+            if (quality === 'UHD') quality = '4K';
+
+const baseName = currentItem.name
+    .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+    .toUpperCase(); // veya Title Case
+
+
+            const key = normalizedTvgId;
+
+            if (!channelGroups.has(key)) {
+                channelGroups.set(key, {
+                    id: `iptv_${crypto.createHash('md5').update(key).digest('hex').slice(0, 16)}`,
+                    name: baseName,
+                    type: 'tv',
+                    logo: currentItem.logo,
+                    category: groupTitleRaw,
+                    epg_channel_id: normalizedTvgId,
+                    attributes: {
+                        ...currentItem.attributes,
+                        'tvg-id': normalizedTvgId,
+                        'group-title': groupTitleRaw
+                    },
+                    streams: []
                 });
-                
-                // Kalite önceliğine göre sırala (4K > FHD > HD > SD)
-                const qualityOrder = { '4K': 4, 'FHD': 3, 'HD': 2, 'SD': 1 };
-                channel.streams.sort((a, b) => (qualityOrder[b.quality] || 0) - (qualityOrder[a.quality] || 0));
-                
-                // En yüksek kaliteyi varsayılan URL olarak ayarla
-                if (channel.streams.length > 0) {
-                    channel.url = channel.streams[0].url;
-                }
-                
-            } else {
-                // Film ve seriler için eski yöntem
-                currentItem.id = `iptv_${crypto.createHash('md5').update(currentItem.name + currentItem.url).digest('hex').substring(0, 16)}`;
-                items.push(currentItem);
             }
-            
-            currentItem = null;
+
+            const channel = channelGroups.get(key);
+
+            channel.streams.push({
+                quality,
+                url: currentItem.url,
+                title: `${baseName} [${quality}]`
+            });
+
+            const order = { '4K': 4, 'FHD': 3, 'HD': 2, 'SD': 1 };
+            channel.streams.sort((a, b) => (order[b.quality] || 0) - (order[a.quality] || 0));
+
+            channel.url = channel.streams[0].url;
+        } else {
+            /* Movies / Series */
+            currentItem.id = `iptv_${crypto.createHash('md5')
+                .update(currentItem.name + currentItem.url)
+                .digest('hex')
+                .slice(0, 16)}`;
+            items.push(currentItem);
         }
+
+        currentItem = null;
     }
 
-    // Birleştirilmiş kanalları items'a ekle
-    for (const channel of channelGroups.values()) {
-        items.push(channel);
+    for (const ch of channelGroups.values()) {
+        items.push(ch);
     }
 
-    const ms = Date.now() - startTs;
-    this.log.debug('M3U parsed', { 
-        lines: lines.length, 
-        items: items.length, 
+    this.log.debug('M3U parsed (normalized)', {
+        lines: lines.length,
+        items: items.length,
         channels: channelGroups.size,
-        ms 
+        ms: Date.now() - startTs
     });
+
     return items;
 }
+
 
     parseAttributes(str) {
         const attrs = {};
