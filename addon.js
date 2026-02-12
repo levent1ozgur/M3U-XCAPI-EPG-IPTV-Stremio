@@ -159,55 +159,63 @@ class M3UEPGAddon {
         this.log.debug('Saved data to cache');
     }
 
-    buildGenresInManifest() {
-        if (!this.manifestRef) return;
-        const tvCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_channels');
-        const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
-        const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
+buildGenresInManifest() {
+    if (!this.manifestRef) return;
+    const tvCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_channels');
+    const movieCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_movies');
+    const seriesCatalog = this.manifestRef.catalogs.find(c => c.id === 'iptv_series');
 
-        if (tvCatalog) {
-            const groups = [
-                ...new Set(
-                    this.channels
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ].sort((a, b) => a.localeCompare(b));
-            if (!groups.includes('All Channels')) groups.unshift('All Channels');
-            tvCatalog.genres = groups;
-        }
-
-        if (movieCatalog) {
-            const movieGroups = [
-                ...new Set(
-                    this.movies
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ].sort((a, b) => a.localeCompare(b));
-            movieCatalog.genres = movieGroups;
-        }
-
-        if (seriesCatalog) {
-            const seriesGroups = [
-                ...new Set(
-                    this.series
-                        .map(c => c.category || c.attributes?.['group-title'])
-                        .filter(Boolean)
-                        .map(s => s.trim())
-                )
-            ].sort((a, b) => a.localeCompare(b));
-            seriesCatalog.genres = seriesGroups;
-        }
-
-        this.log.debug('Catalog genres built', {
-            tvGenres: tvCatalog?.genres?.length || 0,
-            movieGenres: movieCatalog?.genres?.length || 0,
-            seriesGenres: seriesCatalog?.genres?.length || 0
-        });
+    if (tvCatalog) {
+        const groups = [
+            ...new Set(
+                this.channels
+                    .map(c => {
+                        // category veya group-title'ı al
+                        const cat = c.category || c.attributes?.['group-title'];
+                        return cat;
+                    })
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+        
+        if (!groups.includes('All Channels')) groups.unshift('All Channels');
+        tvCatalog.genres = groups;
+        
+        // Debug: Kategorileri logla
+        this.log.debug('TV Categories found:', groups);
     }
+
+    if (movieCatalog) {
+        const movieGroups = [
+            ...new Set(
+                this.movies
+                    .map(c => c.category || c.attributes?.['group-title'])
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+        movieCatalog.genres = movieGroups;
+    }
+
+    if (seriesCatalog) {
+        const seriesGroups = [
+            ...new Set(
+                this.series
+                    .map(c => c.category || c.attributes?.['group-title'])
+                    .filter(Boolean)
+                    .map(s => s.trim())
+            )
+        ].sort((a, b) => a.localeCompare(b));
+        seriesCatalog.genres = seriesGroups;
+    }
+
+    this.log.debug('Catalog genres built', {
+        tvGenres: tvCatalog?.genres?.length || 0,
+        movieGenres: movieCatalog?.genres?.length || 0,
+        seriesGenres: seriesCatalog?.genres?.length || 0
+    });
+}
 
     parseM3U(content) {
     const startTs = Date.now();
@@ -264,12 +272,22 @@ class M3UEPGAddon {
                         name: baseName,
                         type: 'tv',
                         attributes: currentItem.attributes,
-                        category: currentItem.category,
+                        category: currentItem.category, // İlk kategoriyi kullan
                         logo: currentItem.logo,
                         epg_channel_id: currentItem.epg_channel_id,
-                        url: currentItem.url, // İlk stream'in URL'sini varsayılan olarak kullan
+                        url: currentItem.url,
                         streams: []
                     });
+                } else {
+                    // Mevcut kanal - kategoriyi güncelle (eğer yoksa)
+                    const channel = channelGroups.get(groupKey);
+                    if (!channel.category && currentItem.category) {
+                        channel.category = currentItem.category;
+                    }
+                    // Attributes'ı güncelle (kategori bilgisi için)
+                    if (currentItem.attributes['group-title'] && !channel.attributes['group-title']) {
+                        channel.attributes = currentItem.attributes;
+                    }
                 }
                 
                 // Bu kaliteyi stream listesine ekle
