@@ -1,235 +1,145 @@
-// IPTV Stremio Addon Core (FIXED & NORMALIZED)
-// Version 1.4.1 – TV channel merge + quality streams FIXED
-
-require('dotenv').config();
+require("dotenv").config();
 
 const { addonBuilder } = require("stremio-addon-sdk");
 const crypto = require("crypto");
-const LRUCache = require("./lruCache");
-const fetch = require('node-fetch');
-
-const ADDON_NAME = "M3U/EPG TV Addon";
-const ADDON_ID = "org.stremio.m3u-epg-addon";
+const fetch = require("node-fetch");
 
 /* =========================
-   LOGGING
+   CONFIG
 ========================= */
-const DEBUG_ENV = (process.env.DEBUG_MODE || '').toLowerCase() === 'true';
-function makeLogger(cfgDebug) {
-    const enabled = !!cfgDebug || DEBUG_ENV;
-    return {
-        debug: (...a) => { if (enabled) console.log('[DEBUG]', ...a); },
-        info:  (...a) => console.log('[INFO]', ...a),
-        warn:  (...a) => console.warn('[WARN]', ...a),
-        error: (...a) => console.error('[ERROR]', ...a)
-    };
-}
+const ADDON_ID = "org.stremio.m3u.tv";
+const ADDON_NAME = "M3U IPTV TV Addon";
 
 /* =========================
-   CACHE
+   MANIFEST
 ========================= */
-const CACHE_ENABLED = (process.env.CACHE_ENABLED || 'true').toLowerCase() !== 'false';
-const CACHE_TTL_MS = 6 * 3600 * 1000;
-const dataCache = new LRUCache({ max: 300, ttl: CACHE_TTL_MS });
+const manifest = {
+    id: ADDON_ID,
+    version: "1.0.0",
+    name: ADDON_NAME,
+    description: "Merged IPTV channels with quality streams",
+    resources: ["catalog", "stream"],
+    types: ["tv"],
+    catalogs: [
+        {
+            type: "tv",
+            id: "iptv",
+            name: "IPTV",
+            extra: []
+        }
+    ]
+};
 
-function stableStringify(obj) {
-    return JSON.stringify(obj, Object.keys(obj).sort());
-}
-function createCacheKey(config) {
-    return crypto.createHash('md5')
-        .update(stableStringify({
-            provider: config.provider,
-            m3uUrl: config.m3uUrl,
-            xtreamUrl: config.xtreamUrl,
-            xtreamUsername: config.xtreamUsername
-        }))
-        .digest('hex');
-}
+const builder = new addonBuilder(manifest);
 
 /* =========================
-   ADDON CLASS
+   M3U PARSER
 ========================= */
-class M3UEPGAddon {
-    constructor(config = {}) {
-        this.config = config;
-        this.cacheKey = createCacheKey(config);
-        this.channels = [];
-        this.movies = [];
-        this.series = [];
-        this.lastUpdate = 0;
-        this.log = makeLogger(config.debug);
-    }
+function parseM3U(content) {
+    const lines = content.split("\n");
+    const channels = new Map();
+    let current = null;
 
-    /* =========================
-       M3U PARSER (FIXED)
-    ========================= */
-    parseM3U(content) {
-        const lines = content.split('\n');
-        const items = [];
-        const channelGroups = new Map();
-        let currentItem = null;
+    const normalize = s => s.trim().toLowerCase();
 
-        const normalize = s =>
-            typeof s === 'string' ? s.trim().toLowerCase() : '';
+    for (const raw of lines) {
+        const line = raw.trim();
 
-        for (const raw of lines) {
-            const line = raw.trim();
+        if (line.startsWith("#EXTINF")) {
+            const name = line.split(",").pop().trim();
+            const tvgIdMatch = line.match(/tvg-id="([^"]+)"/i);
+            const tvgId = tvgIdMatch ? tvgIdMatch[1] : null;
 
-            if (line.startsWith('#EXTINF:')) {
-                const m = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
-                if (m) {
-                    currentItem = {
-                        duration: parseInt(m[1], 10),
-                        attributes: this.parseAttributes(m[2] || ''),
-                        name: (m[3] || '').trim()
-                    };
-                }
-                continue;
-            }
-
-            if (!line || line.startsWith('#') || !currentItem) continue;
-
-            currentItem.url = line;
-            currentItem.logo = currentItem.attributes['tvg-logo'];
-
-            const rawTvgId = currentItem.attributes['tvg-id'];
-
-            const mergeKey = rawTvgId && rawTvgId.trim()
-                ? normalize(rawTvgId)
-                : normalize(
-                    currentItem.name
-                        .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, '')
-                        .trim()
-                );
-
-            currentItem.epg_channel_id = mergeKey;
-            currentItem.category = currentItem.attributes['group-title'] || '';
-
-            /* ---------- TV CHANNEL ---------- */
-            if (mergeKey) {
-                const qualityMatch = currentItem.name.match(/\b(4K|UHD|FHD|HD|SD)\b/i);
-                let quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'SD';
-                if (quality === 'UHD') quality = '4K';
-
-                const baseName = currentItem.name
-                    .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, '')
-                    .replace(/\s{2,}/g, ' ')
-                    .trim();
-
-                if (!channelGroups.has(mergeKey)) {
-                    channelGroups.set(mergeKey, {
-                        id: `iptv_${crypto.createHash('md5').update(mergeKey).digest('hex').slice(0, 16)}`,
-                        type: 'tv',
-                        name: baseName,
-                        logo: currentItem.logo,
-                        category: currentItem.category,
-                        epg_channel_id: mergeKey,
-                        streams: []
-                    });
-                }
-
-                const channel = channelGroups.get(mergeKey);
-
-                channel.streams.push({
-                    quality,
-                    url: currentItem.url,
-                    title: `${baseName} [${quality}]`
-                });
-
-                const order = { '4K': 4, 'FHD': 3, 'HD': 2, 'SD': 1 };
-                channel.streams.sort((a, b) =>
-                    (order[b.quality] || 0) - (order[a.quality] || 0)
-                );
-
-                channel.url = channel.streams[0].url;
-            }
-
-            currentItem = null;
+            current = { name, tvgId };
+            continue;
         }
 
-        for (const ch of channelGroups.values()) {
-            items.push(ch);
+        if (!current || !line || line.startsWith("#")) continue;
+
+        const qualityMatch = current.name.match(/\b(4K|UHD|FHD|HD|SD)\b/i);
+        let quality = qualityMatch ? qualityMatch[1].toUpperCase() : "SD";
+        if (quality === "UHD") quality = "4K";
+
+        const baseName = current.name
+            .replace(/\b(4K|UHD|FHD|HD|SD)\b/gi, "")
+            .replace(/\s+/g, " ")
+            .trim();
+
+        const key = normalize(current.tvgId || baseName);
+
+        if (!channels.has(key)) {
+            channels.set(key, {
+                id: "iptv_" + crypto.createHash("md5").update(key).digest("hex").slice(0, 12),
+                name: baseName,
+                streams: []
+            });
         }
 
-        this.log.debug('M3U parsed', {
-            channels: channelGroups.size,
-            items: items.length
+        channels.get(key).streams.push({
+            url: line,
+            title: `${baseName} (${quality})`,
+            quality
         });
 
-        return items;
+        current = null;
     }
 
-    parseAttributes(str) {
-        const attrs = {};
-        const re = /([\w-]+)="([^"]*)"/g;
-        let m;
-        while ((m = re.exec(str))) attrs[m[1]] = m[2];
-        return attrs;
+    return Array.from(channels.values());
+}
+
+/* =========================
+   DATA LOAD
+========================= */
+let CHANNELS = [];
+
+async function loadM3U() {
+    const m3uUrl = process.env.M3U_URL;
+
+    if (!m3uUrl || !/^https?:\/\//i.test(m3uUrl)) {
+        throw new Error("M3U_URL missing or not absolute");
     }
 
-    /* =========================
-       STREAM HANDLER
-    ========================= */
-    getStream(id) {
-        const item = this.channels.find(c => c.id === id);
-        if (!item) return null;
+    const res = await fetch(m3uUrl);
+    if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
 
-        return item.streams.map(s => ({
+    const text = await res.text();
+    CHANNELS = parseM3U(text);
+}
+
+/* =========================
+   CATALOG
+========================= */
+builder.defineCatalogHandler(() => {
+    return {
+        metas: CHANNELS.map(ch => ({
+            id: ch.id,
+            type: "tv",
+            name: ch.name
+        }))
+    };
+});
+
+/* =========================
+   STREAM
+========================= */
+builder.defineStreamHandler(({ id }) => {
+    const ch = CHANNELS.find(c => c.id === id);
+    if (!ch) return { streams: [] };
+
+    return {
+        streams: ch.streams.map(s => ({
             url: s.url,
             title: s.title,
             behaviorHints: { notWebReady: true }
-        }));
-    }
-
-    generateMetaPreview(item) {
-        return {
-            id: item.id,
-            type: 'tv',
-            name: item.name,
-            poster: item.logo || `https://via.placeholder.com/300x400?text=${encodeURIComponent(item.name)}`,
-            genres: [item.category || 'Live TV']
-        };
-    }
-}
+        }))
+    };
+});
 
 /* =========================
-   ADDON FACTORY
+   INIT
 ========================= */
-async function createAddon(config) {
-    const manifest = {
-        id: ADDON_ID,
-        version: "2.1.1",
-        name: ADDON_NAME,
-        description: "IPTV M3U addon with proper channel merge",
-        resources: ["catalog", "stream"],
-        types: ["tv"],
-        catalogs: [{
-            type: 'tv',
-            id: 'iptv_all',
-            name: 'All Channels'
-        }],
-        idPrefixes: ["iptv_"]
-    };
+loadM3U().then(() => {
+    console.log("M3U loaded:", CHANNELS.length, "channels");
+}).catch(console.error);
 
-    const builder = new addonBuilder(manifest);
-    const addon = new M3UEPGAddon(config);
-
-    builder.defineCatalogHandler(async () => {
-        const metas = addon.channels.map(c => addon.generateMetaPreview(c));
-        return { metas };
-    });
-
-    builder.defineStreamHandler(async ({ id }) => {
-        const streams = addon.getStream(id);
-        return { streams: streams || [] };
-    });
-
-    // DATA LOAD
-    const res = await fetch(config.m3uUrl);
-    const m3u = await res.text();
-    addon.channels = addon.parseM3U(m3u);
-
-    return builder.getInterface();
-}
-
-module.exports = createAddon;
+module.exports = builder.getInterface();
