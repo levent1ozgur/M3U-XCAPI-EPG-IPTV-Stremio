@@ -323,7 +323,7 @@ class M3UEPGAddon {
     }
 
     isMovieFormat(name) {
-        return [/\(\d{4}\)/, /\d{4}\./, /HD$|FHD$|4K$/i].some(p => p.test(name));
+        return /\(\d{4}\)/.test(name);
     }
 
     async parseEPG(content) {
