@@ -1,9 +1,9 @@
 // xtreamProvider.js
-// Extended to support series (shows) via Xtream API:
-// - fetchData now retrieves series list when includeSeries !== false
-// - fetchSeriesInfo lazily queries per-series episodes (get_series_info)
-// episodes are transformed into Stremio 'videos' (season/episode).
+// Xtream provider with LIVE quality-merge (4K/FHD/HD -> single channel)
+// Movies, Series, EPG preserved.
+
 const fetch = require('node-fetch');
+const crypto = require('crypto');
 
 async function fetchData(addonInstance) {
     const { config } = addonInstance;
@@ -25,7 +25,7 @@ async function fetchData(addonInstance) {
     addonInstance.epgData = {};
 
     if (xtreamUseM3U) {
-        // M3U plus mode (series heuristic limited)
+        // --- M3U MODE (unchanged) ---
         const url =
             `${xtreamUrl}/get.php?username=${encodeURIComponent(xtreamUsername)}` +
             `&password=${encodeURIComponent(xtreamPassword)}` +
@@ -44,7 +44,6 @@ async function fetchData(addonInstance) {
 
         if (config.includeSeries !== false) {
             const seriesCandidates = items.filter(i => i.type === 'series');
-            // Reduce duplication by grouping by cleaned series name
             const seen = new Map();
             for (const sc of seriesCandidates) {
                 const baseName = sc.name.replace(/\bS\d{1,2}E\d{1,2}\b.*$/i, '').trim();
@@ -68,9 +67,11 @@ async function fetchData(addonInstance) {
             addonInstance.series = Array.from(seen.values());
         }
     } else {
-        // JSON API mode
-        const base = `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
-        // Fetch streams + category lists in parallel to map category_id -> category_name
+        // --- JSON API MODE ---
+        const base =
+            `${xtreamUrl}/player_api.php?username=${encodeURIComponent(xtreamUsername)}` +
+            `&password=${encodeURIComponent(xtreamPassword)}`;
+
         const [liveResp, vodResp, liveCatsResp, vodCatsResp] = await Promise.all([
             fetch(`${base}&action=get_live_streams`, { timeout: 30000 }),
             fetch(`${base}&action=get_vod_streams`, { timeout: 30000 }),
@@ -80,6 +81,7 @@ async function fetchData(addonInstance) {
 
         if (!liveResp.ok) throw new Error('Xtream live streams fetch failed');
         if (!vodResp.ok) throw new Error('Xtream VOD streams fetch failed');
+
         const live = await liveResp.json();
         const vod = await vodResp.json();
 
@@ -90,42 +92,62 @@ async function fetchData(addonInstance) {
                 const arr = await liveCatsResp.json();
                 if (Array.isArray(arr)) {
                     for (const c of arr) {
-                        if (c && c.category_id && c.category_name)
-                            liveCatMap[c.category_id] = c.category_name;
+                        if (c?.category_id && c?.category_name) liveCatMap[c.category_id] = c.category_name;
                     }
                 }
             }
-        } catch { /* ignore */ }
+        } catch {}
         try {
             if (vodCatsResp && vodCatsResp.ok) {
                 const arr = await vodCatsResp.json();
                 if (Array.isArray(arr)) {
                     for (const c of arr) {
-                        if (c && c.category_id && c.category_name)
-                            vodCatMap[c.category_id] = c.category_name;
+                        if (c?.category_id && c?.category_name) vodCatMap[c.category_id] = c.category_name;
                     }
                 }
             }
-        } catch { /* ignore */ }
+        } catch {}
 
-        addonInstance.channels = (Array.isArray(live) ? live : []).map(s => {
+        // --- LIVE: QUALITY MERGE ---
+        const groupMap = new Map();
+        for (const s of (Array.isArray(live) ? live : [])) {
             const cat = liveCatMap[s.category_id] || s.category_name || s.category_id || 'Live';
-            return {
-                id: `iptv_live_${s.stream_id}`,
-                name: s.name,
-                type: 'tv',
+            const baseName = cleanName(s.name);
+            const quality = detectQuality(s.name);
+            const key = s.epg_channel_id || baseName;
+
+            if (!groupMap.has(key)) {
+                groupMap.set(key, {
+                    id: `iptv_live_${cryptoHash(key)}`,
+                    name: baseName,
+                    type: 'tv',
+                    logo: s.stream_icon,
+                    category: cat,
+                    epg_channel_id: s.epg_channel_id,
+                    attributes: {
+                        'tvg-logo': s.stream_icon,
+                        'tvg-id': s.epg_channel_id,
+                        'group-title': cat
+                    },
+                    streams: []
+                });
+            }
+
+            groupMap.get(key).streams.push({
+                quality,
                 url: `${xtreamUrl}/live/${xtreamUsername}/${xtreamPassword}/${s.stream_id}.m3u8`,
-                logo: s.stream_icon,
-                category: cat,
-                epg_channel_id: s.epg_channel_id,
-                attributes: {
-                    'tvg-logo': s.stream_icon,
-                    'tvg-id': s.epg_channel_id,
-                    'group-title': cat
-                }
-            };
+                stream_id: s.stream_id
+            });
+        }
+
+        addonInstance.channels = Array.from(groupMap.values()).map(ch => {
+            ch.streams.sort(qualitySort);
+            // default URL (first/best) for legacy consumers
+            ch.url = ch.streams[0]?.url;
+            return ch;
         });
 
+        // --- MOVIES ---
         addonInstance.movies = (Array.isArray(vod) ? vod : []).map(s => {
             const cat = vodCatMap[s.category_id] || s.category_name || 'Movies';
             return {
@@ -145,6 +167,7 @@ async function fetchData(addonInstance) {
             };
         });
 
+        // --- SERIES ---
         if (config.includeSeries !== false) {
             try {
                 const [seriesResp, seriesCatsResp] = await Promise.all([
@@ -157,12 +180,12 @@ async function fetchData(addonInstance) {
                         const arr = await seriesCatsResp.json();
                         if (Array.isArray(arr)) {
                             for (const c of arr) {
-                                if (c && c.category_id && c.category_name)
+                                if (c?.category_id && c?.category_name)
                                     seriesCatMap[c.category_id] = c.category_name;
                             }
                         }
                     }
-                } catch { /* ignore */ }
+                } catch {}
                 if (seriesResp.ok) {
                     const seriesList = await seriesResp.json();
                     if (Array.isArray(seriesList)) {
@@ -185,44 +208,42 @@ async function fetchData(addonInstance) {
                         });
                     }
                 }
-            } catch (e) {
-                // Series optional
-            }
+            } catch {}
         }
     }
 
-    // EPG handling:
+    // --- EPG ---
     if (config.enableEpg) {
-        const customEpgUrl = config.epgUrl && typeof config.epgUrl === 'string' && config.epgUrl.trim() ? config.epgUrl.trim() : null;
+        const customEpgUrl = typeof config.epgUrl === 'string' && config.epgUrl.trim() ? config.epgUrl.trim() : null;
         const epgSource = customEpgUrl
             ? customEpgUrl
             : `${xtreamUrl}/xmltv.php?username=${encodeURIComponent(xtreamUsername)}&password=${encodeURIComponent(xtreamPassword)}`;
-
         try {
             const epgResp = await fetch(epgSource, { timeout: 45000 });
             if (epgResp.ok) {
                 const epgContent = await epgResp.text();
                 addonInstance.epgData = await addonInstance.parseEPG(epgContent);
             }
-        } catch {
-            // Ignore EPG errors
-        }
+        } catch {}
     }
 }
 
 async function fetchSeriesInfo(addonInstance, seriesId) {
-    // For xtream JSON API only
     const { config } = addonInstance;
     if (!seriesId) return { videos: [] };
-    if (!config || !config.xtreamUrl || !config.xtreamUsername || !config.xtreamPassword) return { videos: [] };
+    if (!config?.xtreamUrl || !config?.xtreamUsername || !config?.xtreamPassword) return { videos: [] };
 
-    const base = `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}&password=${encodeURIComponent(config.xtreamPassword)}`;
+    const base =
+        `${config.xtreamUrl}/player_api.php?username=${encodeURIComponent(config.xtreamUsername)}` +
+        `&password=${encodeURIComponent(config.xtreamPassword)}`;
     try {
-        const infoResp = await fetch(`${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`, { timeout: 25000 });
+        const infoResp = await fetch(
+            `${base}&action=get_series_info&series_id=${encodeURIComponent(seriesId)}`,
+            { timeout: 25000 }
+        );
         if (!infoResp.ok) return { videos: [] };
         const infoJson = await infoResp.json();
         const videos = [];
-        // Xtream returns episodes keyed by season: { "1": [ { id, title, container_extension, episode_num, season, ...}, ... ], "2": [...] }
         const episodesObj = infoJson.episodes || {};
         Object.keys(episodesObj).forEach(seasonKey => {
             const seasonEpisodes = episodesObj[seasonKey];
@@ -230,7 +251,9 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
                 for (const ep of seasonEpisodes) {
                     const epId = ep.id;
                     const container = ep.container_extension || 'mp4';
-                    const url = `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
+                    const url =
+                        `${config.xtreamUrl}/series/${encodeURIComponent(config.xtreamUsername)}` +
+                        `/${encodeURIComponent(config.xtreamPassword)}/${epId}.${container}`;
                     videos.push({
                         id: `iptv_series_ep_${epId}`,
                         title: ep.title || `Episode ${ep.episode_num}`,
@@ -244,7 +267,6 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
                 }
             }
         });
-        // Sort by season then episode
         videos.sort((a, b) => (a.season - b.season) || (a.episode - b.episode));
         return { videos, fetchedAt: Date.now() };
     } catch {
@@ -252,8 +274,29 @@ async function fetchSeriesInfo(addonInstance, seriesId) {
     }
 }
 
+// --- helpers ---
 function cryptoHash(text) {
-    return require('crypto').createHash('md5').update(text).digest('hex').slice(0, 12);
+    return crypto.createHash('md5').update(String(text)).digest('hex').slice(0, 12);
+}
+
+function cleanName(name = '') {
+    return name
+        .replace(/\b(4K|UHD|FHD|FULL\s*HD|1080P|HD|720P|SD)\b/ig, '')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+}
+
+function detectQuality(name = '') {
+    const n = name.toUpperCase();
+    if (/(4K|UHD)/.test(n)) return '4K';
+    if (/(FHD|FULL\s*HD|1080)/.test(n)) return 'FHD';
+    if (/(HD|720)/.test(n)) return 'HD';
+    return 'SD';
+}
+
+function qualitySort(a, b) {
+    const order = { '4K': 0, 'FHD': 1, 'HD': 2, 'SD': 3 };
+    return (order[a.quality] ?? 9) - (order[b.quality] ?? 9);
 }
 
 module.exports = {
