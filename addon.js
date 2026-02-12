@@ -210,53 +210,109 @@ class M3UEPGAddon {
     }
 
     parseM3U(content) {
-        const startTs = Date.now();
-        const lines = content.split('\n');
-        const items = [];
-        let currentItem = null;
-        for (const raw of lines) {
-            const line = raw.trim();
-            if (line.startsWith('#EXTINF:')) {
-                const matches = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
-                if (matches) {
-                    currentItem = {
-                        duration: parseInt(matches[1]),
-                        attributes: this.parseAttributes(matches[2] || ''),
-                        name: (matches[3] || '').trim()
-                    };
+    const startTs = Date.now();
+    const lines = content.split('\n');
+    const items = [];
+    const channelGroups = new Map(); // tvg-id -> kanal grubu
+    let currentItem = null;
+
+    for (const raw of lines) {
+        const line = raw.trim();
+        if (line.startsWith('#EXTINF:')) {
+            const matches = line.match(/#EXTINF:(-?\d+)(?:\s+(.*))?,(.*)/);
+            if (matches) {
+                currentItem = {
+                    duration: parseInt(matches[1]),
+                    attributes: this.parseAttributes(matches[2] || ''),
+                    name: (matches[3] || '').trim()
+                };
+            }
+        } else if (line && !line.startsWith('#') && currentItem) {
+            currentItem.url = line;
+            currentItem.logo = currentItem.attributes['tvg-logo'];
+            currentItem.epg_channel_id = currentItem.attributes['tvg-id'] || currentItem.attributes['tvg-name'];
+            currentItem.category = currentItem.attributes['group-title'];
+
+            const group = (currentItem.attributes['group-title'] || '').toLowerCase();
+            const lower = currentItem.name.toLowerCase();
+            const isMovie = group.includes('movie') || lower.includes('movie') || this.isMovieFormat(currentItem.name);
+            const isSeries = !isMovie && (
+                group.includes('series') || 
+                group.includes('show') || 
+                /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) || 
+                /\bSeason\s?\d+/i.test(currentItem.name)
+            );
+            
+            currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
+
+            // TV kanalları için birleştirme yap
+            if (currentItem.type === 'tv' && currentItem.epg_channel_id) {
+                const groupKey = currentItem.epg_channel_id;
+                
+                // Kalite bilgisini ayıkla (4K, FHD, HD)
+                const qualityMatch = currentItem.name.match(/\b(4K|FHD|HD|SD)\b/i);
+                const quality = qualityMatch ? qualityMatch[1].toUpperCase() : 'SD';
+                
+                // Temel kanal adını temizle (kalite bilgisi olmadan)
+                const baseName = currentItem.name.replace(/\s*(4K|FHD|HD|SD)\s*/gi, '').trim();
+                
+                if (!channelGroups.has(groupKey)) {
+                    // İlk kez görülen kanal
+                    const channelId = `iptv_${crypto.createHash('md5').update(groupKey).digest('hex').substring(0, 16)}`;
+                    channelGroups.set(groupKey, {
+                        id: channelId,
+                        name: baseName,
+                        type: 'tv',
+                        attributes: currentItem.attributes,
+                        category: currentItem.category,
+                        logo: currentItem.logo,
+                        epg_channel_id: currentItem.epg_channel_id,
+                        url: currentItem.url, // İlk stream'in URL'sini varsayılan olarak kullan
+                        streams: []
+                    });
                 }
-            } else if (line && !line.startsWith('#') && currentItem) {
-                currentItem.url = line;
-                currentItem.logo = currentItem.attributes['tvg-logo'];
-                currentItem.epg_channel_id = currentItem.attributes['tvg-id'] || currentItem.attributes['tvg-name'];
-                currentItem.category = currentItem.attributes['group-title'];
-
-                const group = (currentItem.attributes['group-title'] || '').toLowerCase();
-                const lower = currentItem.name.toLowerCase();
-
-                const isMovie =
-                    group.includes('movie') ||
-                    lower.includes('movie') ||
-                    this.isMovieFormat(currentItem.name);
-
-                const isSeries =
-                    !isMovie && (
-                        group.includes('series') ||
-                        group.includes('show') ||
-                        /\bS\d{1,2}E\d{1,2}\b/i.test(currentItem.name) ||
-                        /\bSeason\s?\d+/i.test(currentItem.name)
-                    );
-
-                currentItem.type = isSeries ? 'series' : (isMovie ? 'movie' : 'tv');
+                
+                // Bu kaliteyi stream listesine ekle
+                const channel = channelGroups.get(groupKey);
+                channel.streams.push({
+                    quality: quality,
+                    url: currentItem.url,
+                    name: currentItem.name
+                });
+                
+                // Kalite önceliğine göre sırala (4K > FHD > HD > SD)
+                const qualityOrder = { '4K': 4, 'FHD': 3, 'HD': 2, 'SD': 1 };
+                channel.streams.sort((a, b) => (qualityOrder[b.quality] || 0) - (qualityOrder[a.quality] || 0));
+                
+                // En yüksek kaliteyi varsayılan URL olarak ayarla
+                if (channel.streams.length > 0) {
+                    channel.url = channel.streams[0].url;
+                }
+                
+            } else {
+                // Film ve seriler için eski yöntem
                 currentItem.id = `iptv_${crypto.createHash('md5').update(currentItem.name + currentItem.url).digest('hex').substring(0, 16)}`;
                 items.push(currentItem);
-                currentItem = null;
             }
+            
+            currentItem = null;
         }
-        const ms = Date.now() - startTs;
-        this.log.debug('M3U parsed', { lines: lines.length, items: items.length, ms });
-        return items;
     }
+
+    // Birleştirilmiş kanalları items'a ekle
+    for (const channel of channelGroups.values()) {
+        items.push(channel);
+    }
+
+    const ms = Date.now() - startTs;
+    this.log.debug('M3U parsed', { 
+        lines: lines.length, 
+        items: items.length, 
+        channels: channelGroups.size,
+        ms 
+    });
+    return items;
+}
 
     parseAttributes(str) {
         const attrs = {};
@@ -422,61 +478,83 @@ class M3UEPGAddon {
     }
 
     generateMetaPreview(item) {
-        const meta = { id: item.id, type: item.type, name: item.name };
-        if (item.type === 'tv') {
-            const epgId = item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
-            const current = this.getCurrentProgram(epgId);
-            meta.description = current
-                ? `📡 Now: ${current.title}${current.description ? `\n${current.description}` : ''}`
-                : '📡 Live Channel';
-            meta.poster = this.deriveFallbackLogoUrl(item);
-            meta.genres = item.category
-                ? [item.category]
-                : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']);
-            meta.runtime = 'Live';
-        } else if (item.type === 'movie') {
-            meta.poster = item.poster ||
-                item.attributes?.['tvg-logo'] ||
-                `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`;
-            meta.year = item.year;
-            if (!meta.year) {
-                const m = item.name.match(/\((\d{4})\)/);
-                if (m) meta.year = parseInt(m[1]);
-            }
-            meta.description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
-            meta.genres = item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'];
-        } else if (item.type === 'series') {
-            meta.poster = item.poster ||
-                item.attributes?.['tvg-logo'] ||
-                `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(item.name)}`;
-            meta.description = item.plot || item.attributes?.['plot'] || 'Series / Show';
-            meta.genres = item.category
-                ? [item.category]
-                : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Series']);
+    const meta = { id: item.id, type: item.type, name: item.name };
+    if (item.type === 'tv') {
+        const epgId = item.epg_channel_id || item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
+        const current = this.getCurrentProgram(epgId);
+        meta.description = current
+            ? `📡 Now: ${current.title}${current.description ? `\n${current.description}` : ''}`
+            : '📡 Live Channel';
+        
+        // Logo'yu item'dan direkt al (parseM3U'da zaten set edilmiş)
+        meta.poster = item.logo || item.attributes?.['tvg-logo'] || 
+            `https://via.placeholder.com/300x400/333333/FFFFFF?text=${encodeURIComponent(item.name)}`;
+        
+        meta.genres = item.category
+            ? [item.category]
+            : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']);
+        meta.runtime = 'Live';
+        
+        // Eğer birden fazla kalite varsa bunu belirt
+        if (item.streams && item.streams.length > 1) {
+            meta.description = `🎬 ${item.streams.length} quality options available\n\n` + meta.description;
         }
-        return meta;
+    } else if (item.type === 'movie') {
+        meta.poster = item.poster ||
+            item.attributes?.['tvg-logo'] ||
+            `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`;
+        meta.year = item.year;
+        if (!meta.year) {
+            const m = item.name.match(/\((\d{4})\)/);
+            if (m) meta.year = parseInt(m[1]);
+        }
+        meta.description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
+        meta.genres = item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'];
+    } else if (item.type === 'series') {
+        meta.poster = item.poster ||
+            item.attributes?.['tvg-logo'] ||
+            `https://via.placeholder.com/300x450/3366CC/FFFFFF?text=${encodeURIComponent(item.name)}`;
+        meta.description = item.plot || item.attributes?.['plot'] || 'Series / Show';
+        meta.genres = item.category
+            ? [item.category]
+            : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Series']);
     }
+    return meta;
+}
 
-    getStream(id) {
-        // Episode streams
-        if (id.startsWith('iptv_series_ep_')) {
-            const epEntry = this.lookupEpisodeById(id);
-            if (!epEntry) return null;
-            return {
-                url: epEntry.url,
-                title: `${epEntry.title || 'Episode'}${epEntry.season ? ` S${epEntry.season}E${epEntry.episode}` : ''}`,
-                behaviorHints: { notWebReady: true }
-            };
-        }
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
-        if (!item) return null;
+getStream(id) {
+    // Episode streams
+    if (id.startsWith('iptv_series_ep_')) {
+        const epEntry = this.lookupEpisodeById(id);
+        if (!epEntry) return null;
         return {
-            url: item.url,
-            title: item.type === 'tv' ? `${item.name} - Live` : item.name,
+            url: epEntry.url,
+            title: `${epEntry.title || 'Episode'}${epEntry.season ? ` S${epEntry.season}E${epEntry.episode}` : ''}`,
             behaviorHints: { notWebReady: true }
         };
     }
+
+    const all = [...this.channels, ...this.movies];
+    const item = all.find(i => i.id === id);
+    if (!item) return null;
+
+    // Eğer item birden fazla stream varsa (TV kanalları için), hepsini döndür
+    if (item.streams && item.streams.length > 0) {
+        return item.streams.map(stream => ({
+            url: stream.url,
+            title: `${item.name} [${stream.quality}]`,
+            name: stream.quality,
+            behaviorHints: { notWebReady: true }
+        }));
+    }
+
+    // Tek stream için eski format
+    return {
+        url: item.url,
+        title: item.type === 'tv' ? `${item.name} - Live` : item.name,
+        behaviorHints: { notWebReady: true }
+    };
+}
 
     lookupEpisodeById(epId) {
         // Check cached series info
@@ -531,57 +609,66 @@ class M3UEPGAddon {
         return this.getDetailedMeta(id);
     }
 
-    getDetailedMeta(id) {
-        const all = [...this.channels, ...this.movies];
-        const item = all.find(i => i.id === id);
-        if (!item) return null;
-        if (item.type === 'tv') {
-            const epgId = item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
-            const current = this.getCurrentProgram(epgId);
-            const upcoming = this.getUpcomingPrograms(epgId, 3);
-            let description = `📺 CHANNEL: ${item.name}`;
-            if (current) {
-                const start = current.startTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
-                const end = current.stopTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
-                description += `\n\n📡 NOW: ${current.title}${start && end ? ` (${start}-${end})` : ''}`;
-                if (current.description) description += `\n\n${current.description}`;
-            }
-            if (upcoming.length) {
-                description += '\n\n📅 UPCOMING:\n';
-                for (const p of upcoming) {
-                    description += `${p.startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - ${p.title}\n`;
-                }
-            }
-            return {
-                id: item.id,
-                type: 'tv',
-                name: item.name,
-                poster: this.deriveFallbackLogoUrl(item),
-                description,
-                genres: item.category
-                    ? [item.category]
-                    : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']),
-                runtime: 'Live'
-            };
-        } else {
-            let year = item.year;
-            if (!year) {
-                const m = item.name.match(/\((\d{4})\)/);
-                if (m) year = parseInt(m[1]);
-            }
-            const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
-            return {
-                id: item.id,
-                type: 'movie',
-                name: item.name,
-                poster: item.poster || item.attributes?.['tvg-logo'] ||
-                    `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`,
-                description,
-                genres: item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'],
-                year
-            };
+getDetailedMeta(id) {
+    const all = [...this.channels, ...this.movies];
+    const item = all.find(i => i.id === id);
+    if (!item) return null;
+    if (item.type === 'tv') {
+        // epg_channel_id'yi önce kontrol et (parseM3U'da set edilmiş)
+        const epgId = item.epg_channel_id || item.attributes?.['tvg-id'] || item.attributes?.['tvg-name'];
+        const current = this.getCurrentProgram(epgId);
+        const upcoming = this.getUpcomingPrograms(epgId, 3);
+        let description = `📺 CHANNEL: ${item.name}`;
+        
+        // Birden fazla kalite varsa bunu ekle
+        if (item.streams && item.streams.length > 1) {
+            description += `\n🎬 ${item.streams.length} quality options available`;
         }
+        
+        if (current) {
+            const start = current.startTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
+            const end = current.stopTime?.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) || '';
+            description += `\n\n📡 NOW: ${current.title}${start && end ? ` (${start}-${end})` : ''}`;
+            if (current.description) description += `\n\n${current.description}`;
+        }
+        if (upcoming.length) {
+            description += '\n\n📅 UPCOMING:\n';
+            for (const p of upcoming) {
+                description += `${p.startTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - ${p.title}\n`;
+            }
+        }
+        return {
+            id: item.id,
+            type: 'tv',
+            name: item.name,
+            // Logo'yu item'dan direkt al
+            poster: item.logo || item.attributes?.['tvg-logo'] || 
+                `https://via.placeholder.com/300x400/333333/FFFFFF?text=${encodeURIComponent(item.name)}`,
+            description,
+            genres: item.category
+                ? [item.category]
+                : (item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Live TV']),
+            runtime: 'Live'
+        };
+    } else {
+        let year = item.year;
+        if (!year) {
+            const m = item.name.match(/\((\d{4})\)/);
+            if (m) year = parseInt(m[1]);
+        }
+        const description = item.plot || item.attributes?.['plot'] || `Movie: ${item.name}`;
+        return {
+            id: item.id,
+            type: 'movie',
+            name: item.name,
+            poster: item.poster || item.attributes?.['tvg-logo'] ||
+                `https://via.placeholder.com/300x450/CC6600/FFFFFF?text=${encodeURIComponent(item.name)}`,
+            description,
+            genres: item.attributes?.['group-title'] ? [item.attributes['group-title']] : ['Movie'],
+            year
+        };
     }
+}
 }
 
 async function createAddon(config) {
@@ -686,27 +773,24 @@ async function createAddon(config) {
             }
         });
 
-        builder.defineStreamHandler(async ({ type, id }) => {
-            try {
-                if (id.startsWith('iptv_series_ep_')) {
-                    const stream = addonInstance.getStream(id);
-                    if (!stream) return { streams: [] };
-                    if (addonInstance.config.debug) {
-                        console.log('[DEBUG] Series Episode Stream request', { id, url: stream.url });
-                    }
-                    return { streams: [stream] };
-                }
-                const stream = addonInstance.getStream(id);
-                if (!stream) return { streams: [] };
-                if (addonInstance.config.debug) {
-                    console.log('[DEBUG] Stream request', { id, url: stream.url });
-                }
-                return { streams: [stream] };
-            } catch (e) {
-                console.error('[STREAM] Error', e);
-                return { streams: [] };
-            }
-        });
+  builder.defineStreamHandler(async ({ type, id }) => {
+    try {
+        const streamData = addonInstance.getStream(id);
+        if (!streamData) return { streams: [] };
+        
+        // Eğer array dönerse (birden fazla kalite), direkt kullan
+        const streams = Array.isArray(streamData) ? streamData : [streamData];
+        
+        if (addonInstance.config.debug) {
+            console.log('[DEBUG] Stream request', { id, streamCount: streams.length });
+        }
+        
+        return { streams };
+    } catch (e) {
+        console.error('[STREAM] Error', e);
+        return { streams: [] };
+    }
+});
 
         builder.defineMetaHandler(async ({ type, id }) => {
             try {
